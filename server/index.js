@@ -1,5 +1,6 @@
 import express from 'express'
 import db, { getSetting, setSetting } from './db.js'
+import { LOAN_PERIODS, LOAN_RATES, LOAN_MIN, LOAN_MAX, validateLoanOpts, settleLoan } from './loan.js'
 
 const app = express()
 app.use(express.json())
@@ -29,6 +30,10 @@ const allRides = () => db.prepare('SELECT * FROM rides ORDER BY id').all()
 const operatingRides = () => db.prepare("SELECT * FROM rides WHERE status='operating'").all()
 const allVendors = () => db.prepare('SELECT * FROM vendors ORDER BY id').all()
 const allStaff = () => db.prepare('SELECT * FROM staff ORDER BY id').all()
+const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status != 'repaid' ORDER BY id").all()
+// 当前待还债务总额 = 未结清贷款的剩余本金 + 逾期利息
+const outstandingDebt = () => db.prepare("SELECT COALESCE(SUM(balance + arrears),0) s FROM loans WHERE status != 'repaid'").get().s
+const syncLoanSetting = () => setSetting('loan', outstandingDebt())
 
 function logFinance(day, label, amount, detail) {
   db.prepare('INSERT INTO finance(tick,day,label,amount,detail) VALUES(?,?,?,?,?)')
@@ -58,6 +63,10 @@ function tick() {
     const rent = allVendors().reduce((s, v) => s + v.rent, 0)
     cash -= rent
     logFinance(day, '租金', -rent, '当日商铺租金')
+    // 贷款分期日结：同步扣款、债务余额与本金利息流水
+    const loanRes = settleLoans(day, cash)
+    cash = loanRes.cash
+    rep += loanRes.repShift
     day += 1
     setSetting('day', day)
   }
@@ -185,6 +194,32 @@ function computeSatisfaction() {
   return Math.max(10, Math.min(100, sat))
 }
 
+// ---------------- 贷款分期日结 ----------------
+// 每日结算所有未结清贷款：从现金扣款(先息后本)，更新债务余额，
+// 记录本金/利息财务流水；现金不足时部分扣款并记逾期，后续日结继续追缴
+function settleLoans(day, cash) {
+  let repShift = 0
+  const upd = db.prepare('UPDATE loans SET balance=?, arrears=?, paid_periods=?, status=? WHERE id=?')
+  const loans = activeLoans()
+  for (const l of loans) {
+    const r = settleLoan(l, cash)
+    cash = r.cash
+    upd.run(r.loan.balance, r.loan.arrears, r.loan.paid_periods, r.loan.status, l.id)
+    if (r.intPay > 0) logFinance(day, '还贷利息', -r.intPay, `贷款#${l.id} 第${r.periodNo}/${l.periods}期`)
+    if (r.priPay > 0) logFinance(day, '还贷本金', -r.priPay, `贷款#${l.id} 第${r.periodNo}/${l.periods}期`)
+    if (r.loan.status === 'overdue') {
+      repShift -= 1.5   // 逾期损害声誉
+      if (r.newlyOverdue) {
+        db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+          .run(state.tick(), day, 'loan', '贷款逾期',
+            `贷款#${l.id} 因现金不足未能足额还款，未还部分已转入后续日结继续追缴。`, -1, 'active')
+      }
+    }
+  }
+  if (loans.length || outstandingDebt() !== state.loan()) syncLoanSetting()
+  return { cash, repShift }
+}
+
 // ---------------- 事件系统 ----------------
 const allEvents = {
   actives: () => db.prepare("SELECT * FROM events WHERE status='active'").all()
@@ -231,7 +266,9 @@ app.get('/api/state', (req, res) => {
     cash: state.cash(),
     reputation: state.reputation(),
     ticket: state.ticket(),
-    loan: state.loan(),
+    loan: outstandingDebt(),
+    loans: db.prepare('SELECT * FROM loans ORDER BY id DESC LIMIT 20').all(),
+    loanOptions: { periods: LOAN_PERIODS, rates: LOAN_RATES, min: LOAN_MIN, max: LOAN_MAX },
     visitorToday: visitors.filter(v => v.day === state.day()).reduce((s, v) => s + v.count, 0),
     visitors,
     zones: allZones(),
@@ -407,13 +444,18 @@ app.post('/api/ticket', (req, res) => {
 })
 
 app.post('/api/loan', (req, res) => {
-  const amount = num(req.body?.amount, 50000) * -1 * -1
-  let loan = state.loan() + Math.abs(amount)
-  setSetting('loan', loan)
-  let cash = state.cash() + Math.abs(amount)
-  setSetting('cash', Math.round(cash))
-  logFinance(state.day(), '贷款', Math.abs(amount), '取得贷款')
-  res.json({ ok: true, loan })
+  const b = req.body || {}
+  const amount = Math.round(num(b.amount, 0))
+  const periods = num(b.periods, 0)
+  const rate = Number(b.rate)
+  const err = validateLoanOpts(amount, periods, rate)
+  if (err) return res.status(400).json({ ok: false, msg: err })
+  const r = db.prepare("INSERT INTO loans(day,principal,rate,periods,paid_periods,balance,arrears,status) VALUES(?,?,?,?,0,?,0,'active')")
+    .run(state.day(), amount, rate, periods, amount)
+  setSetting('cash', Math.round(state.cash() + amount))
+  syncLoanSetting()
+  logFinance(state.day(), '贷款', amount, `分期借款 ${periods}期·每期利率 ${(rate * 100).toFixed(1)}%`)
+  res.json({ ok: true, id: Number(r.lastInsertRowid), loan: outstandingDebt() })
 })
 
 // ---- 活动与事件 ----

@@ -103,6 +103,18 @@ CREATE TABLE IF NOT EXISTS events (
   feedback TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS loans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  day INTEGER NOT NULL,               -- 借款发生日
+  principal INTEGER NOT NULL,         -- 原始本金
+  rate REAL NOT NULL,                 -- 每期(日)利率
+  periods INTEGER NOT NULL,           -- 总期数(天)
+  paid_periods INTEGER NOT NULL DEFAULT 0,  -- 已还期数
+  balance INTEGER NOT NULL,           -- 剩余本金(债务余额)
+  arrears INTEGER NOT NULL DEFAULT 0, -- 逾期未还利息
+  status TEXT NOT NULL DEFAULT 'active'     -- active/overdue/repaid
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -194,6 +206,17 @@ function seed() {
   }
 }
 seed()
+
+// 旧版一次性贷款迁移为分期借款（7期·每期利率1%）
+function migrateLegacyLoan() {
+  const legacy = Number(getSetting('loan', 0)) || 0
+  const cnt = db.prepare('SELECT COUNT(*) n FROM loans').get().n
+  if (legacy > 0 && cnt === 0) {
+    db.prepare("INSERT INTO loans(day,principal,rate,periods,paid_periods,balance,arrears,status) VALUES(?,?,?,?,0,?,0,'active')")
+      .run(Number(getSetting('day', 1)) || 1, legacy, 0.01, 7, legacy)
+  }
+}
+migrateLegacyLoan()
 
 export default db
 export { now, getSetting, setSetting }
