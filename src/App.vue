@@ -58,6 +58,7 @@ onMounted(store.refresh)
         </div>
         <div class="stats">
           <div class="pill">💰 <b :class="store.data && store.data.cash < 0 ? 'neg money' : 'money'">{{ store.data?.cash?.toLocaleString() ?? 0 }}</b></div>
+          <div class="pill" :class="{ 'debt-warn': store.debt.overdueCount }" v-if="store.debt.remainPrincipal">🏦 负债 <b class="money neg">{{ store.debt.remainPrincipal.toLocaleString() }}</b><em v-if="store.debt.overdueCount">（逾期 ¥{{ store.debt.arrears.toLocaleString() }}）</em></div>
           <div class="pill">⭐ 声誉 <b>{{ store.data?.reputation ?? 0 }}</b></div>
           <div class="pill">😊 满意度 <b>{{ Math.round(store.data?.avgs?.satisfaction ?? 0) }}</b></div>
           <div class="pill">🎫 今日入园 <b>{{ store.data?.visitorToday ?? 0 }}</b></div>
@@ -105,4 +106,6 @@ main { flex: 1; min-width: 0; }
 .stats { display: flex; gap: 12px; flex-wrap: wrap; }
 .pill { font-size: 13px; color: var(--muted); background: var(--panel); border: 1px solid var(--border); padding: 6px 12px; border-radius: 20px; }
 .pill b { color: var(--text); margin-left: 4px; }
+.pill em { font-style: normal; color: #ff8080; margin-left: 4px; }
+.pill.debt-warn { border-color: rgba(255,80,80,.55); background: rgba(255,80,80,.12); }
 </style>

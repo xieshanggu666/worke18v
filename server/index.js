@@ -9,6 +9,13 @@ const HOURS_PER_DAY = 10   // 9:00 ~ 18:00
 const OPEN_HOUR = 9
 const TICK_MS = 2000
 
+// 分期贷款参数：每 1 个游戏日 = 1 期
+const LOAN_PERIOD_CHOICES = [5, 10, 20, 30]   // 可选期数(天)
+const LOAN_RATE_CHOICES = [0.005, 0.01, 0.02] // 可选每期利率
+const LOAN_MIN = 1000
+const LOAN_MAX = 5000000
+const OVERDUE_PENALTY = 0.02                  // 逾期挂账每日罚息 2%
+
 const num = (v, d = 0) => { const n = Number(v); return Number.isFinite(n) ? n : d }
 
 // ---------------- 工具 ----------------
@@ -19,8 +26,7 @@ const state = {
   cash: () => num(getSetting('cash'), 0),
   reputation: () => num(getSetting('reputation'), 70),
   ticket: () => num(getSetting('ticket'), 120),
-  guestBase: () => num(getSetting('guestBase'), 600),
-  loan: () => num(getSetting('loan'), 0)
+  guestBase: () => num(getSetting('guestBase'), 600)
 }
 
 const allZones = () => db.prepare('SELECT * FROM zones ORDER BY id').all()
@@ -33,6 +39,86 @@ const allStaff = () => db.prepare('SELECT * FROM staff ORDER BY id').all()
 function logFinance(day, label, amount, detail) {
   db.prepare('INSERT INTO finance(tick,day,label,amount,detail) VALUES(?,?,?,?,?)')
     .run(state.tick(), day, label, Math.round(amount), detail || '')
+}
+
+// ---------------- 分期贷款 ----------------
+const activeLoans = () => db.prepare("SELECT * FROM loans WHERE status='active' ORDER BY id").all()
+
+// 未偿本金合计（剩余本金，不含利息）
+function loanDebt() {
+  return activeLoans().reduce((s, l) => s + l.remain_principal, 0)
+}
+
+// 贷款汇总：剩余本金、挂账(逾期)金额、逾期贷款数
+function debtSummary() {
+  const ls = activeLoans()
+  return {
+    remainPrincipal: ls.reduce((s, l) => s + l.remain_principal, 0),
+    arrears: ls.reduce((s, l) => s + l.arrears_p + l.arrears_i, 0),
+    overdueCount: ls.filter(l => l.arrears_p + l.arrears_i > 0).length
+  }
+}
+
+// 等额本息每期应还（末期靠尾款兜底，保证正好还清）
+function calcInstallment(principal, rate, periods) {
+  if (!rate) return Math.round(principal / periods)
+  const pay = principal * rate * Math.pow(1 + rate, periods) / (Math.pow(1 + rate, periods) - 1)
+  return Math.round(pay)
+}
+
+// 日结扣款（每天 1 期）；cash 为入参形式，返回 { cash, overdueHits, overdueIds }
+function settleLoans(cash, day) {
+  let overdueHits = 0
+  const overdueIds = []
+  for (const l of activeLoans()) {
+    let dueP = 0, dueI = 0
+    if (l.arrears_p + l.arrears_i > 0) {
+      // 有逾期挂账：按挂账总额每日加罚息，先清欠账，不顺延新一期
+      const penalty = Math.round((l.arrears_p + l.arrears_i) * OVERDUE_PENALTY)
+      dueP = l.arrears_p
+      dueI = l.arrears_i + penalty
+    } else if (l.paid_periods < l.periods) {
+      // 正常到期：末期收剩余本金 + 当期利息
+      dueI = Math.round(l.remain_principal * l.rate)
+      dueP = l.paid_periods + 1 >= l.periods
+        ? l.remain_principal
+        : Math.min(l.installment - dueI, l.remain_principal)
+    } else continue
+
+    const due = dueP + dueI
+    const wasOverdue = (l.arrears_p + l.arrears_i) > 0
+    if (cash >= due) {
+      // 足额还款
+      cash -= due
+      if (dueI > 0) logFinance(day, '利息', -dueI, `贷款 #${l.id} 第${l.paid_periods + 1}期利息${wasOverdue ? '(含罚息)' : ''}`)
+      if (dueP > 0) logFinance(day, '贷款', -dueP, `偿还贷款 #${l.id} 第${l.paid_periods + 1}期本金`)
+      const remainPrincipal = Math.max(0, l.remain_principal - dueP)
+      const paidPeriods = wasOverdue ? l.paid_periods : l.paid_periods + 1
+      // 逾期补缴可能使本金先于期数归零，本金还清即结清
+      const finished = remainPrincipal <= 0
+      const upd = finished
+        ? db.prepare("UPDATE loans SET remain_principal=?, paid_periods=?, arrears_p=0, arrears_i=0, status='done' WHERE id=?")
+        : db.prepare('UPDATE loans SET remain_principal=?, paid_periods=?, arrears_p=0, arrears_i=0 WHERE id=?')
+      upd.run(remainPrincipal, paidPeriods, l.id)
+    } else {
+      // 现金不足：按 利息(含罚息) → 本金 的顺序部分偿还，余额挂账并转逾期
+      let avail = Math.max(0, cash)
+      const payI = Math.min(dueI, avail)
+      avail -= payI
+      const payP = Math.min(dueP, avail)
+      avail -= payP
+      cash -= payI + payP
+      if (payI > 0) logFinance(day, '利息', -Math.round(payI), `贷款 #${l.id} 部分付息(现金不足)`)
+      if (payP > 0) logFinance(day, '贷款', -Math.round(payP), `贷款 #${l.id} 部分还本(现金不足)`)
+      const leftI = dueI - payI
+      const leftP = dueP - payP
+      db.prepare('UPDATE loans SET remain_principal=?, arrears_p=?, arrears_i=?, overdue_days=overdue_days+1 WHERE id=?')
+        .run(Math.max(0, l.remain_principal - payP), Math.round(leftP), Math.round(leftI), l.id)
+      overdueHits += 1
+      overdueIds.push(l.id)
+    }
+  }
+  return { cash, overdueHits, overdueIds }
 }
 
 // ---------------- 游戏主循环 ----------------
@@ -48,6 +134,8 @@ function tick() {
   setSetting('tick', tickCount)
 
   // 跨天结算
+  let overdueHits = 0
+  let overdueIds = []
   if (hour > OPEN_HOUR + HOURS_PER_DAY - 1) {
     hour = OPEN_HOUR
     // 日结工资
@@ -58,6 +146,11 @@ function tick() {
     const rent = allVendors().reduce((s, v) => s + v.rent, 0)
     cash -= rent
     logFinance(day, '租金', -rent, '当日商铺租金')
+    // 日结分期贷款：同步扣款；现金不足时按 利息→本金 部分偿还并转逾期挂账
+    const settled = settleLoans(cash, day)
+    cash = settled.cash
+    overdueHits = settled.overdueHits
+    overdueIds = settled.overdueIds
     day += 1
     setSetting('day', day)
   }
@@ -154,6 +247,14 @@ function tick() {
   const budgetHealth = cash > 0 ? Math.min(1, cash / 200000) : -0.4
   rep = Math.max(5, Math.min(100, rep + (satisfaction - 70) * 0.15 + budgetHealth * 2 + eventRepShift))
 
+  // 贷款逾期：信用受损（本次日结新产生的逾期，每条 -1.5 声誉）
+  if (overdueHits > 0) {
+    rep = Math.max(5, rep - 1.5 * overdueHits)
+    const ids = overdueIds.join('、#')
+    db.prepare('INSERT INTO events(tick,day,type,title,desc,impact,status) VALUES(?,?,?,?,?,?,?)')
+      .run(tickCount, day, 'overdue', '贷款还款逾期', `日结时现金不足以偿还分期贷款 #${ids}，欠款已挂账并按日计 2% 罚息，后续日结将优先补扣。`, -2, 'active')
+  }
+
   // 满意度驱动消费
   const eatSpend = Math.round(entering * avgSpend * 0.3)
   cash += eatSpend
@@ -226,12 +327,29 @@ app.get('/api/state', (req, res) => {
   const rides = allRides()
   const visitors = db.prepare('SELECT * FROM visitors ORDER BY id DESC LIMIT 60').all().reverse()
   const fin = db.prepare('SELECT * FROM finance ORDER BY id DESC LIMIT 80').all().reverse()
+  const loans = activeLoans().map(l => {
+    const arrears = l.arrears_p + l.arrears_i
+    const nextI = l.paid_periods < l.periods ? Math.round(l.remain_principal * l.rate) : 0
+    const nextP = l.paid_periods + 1 >= l.periods ? l.remain_principal : Math.min(l.installment - nextI, l.remain_principal)
+    return {
+      ...l,
+      ratePct: Math.round(l.rate * 1000) / 10,
+      arrears,
+      nextDue: l.paid_periods < l.periods ? nextP + nextI : 0,
+      nextPrincipal: nextP,
+      nextInterest: nextI,
+      over: arrears > 0
+    }
+  })
   return res.json({
     clock: { day: state.day(), hour: state.hour(), tick: state.tick() },
     cash: state.cash(),
     reputation: state.reputation(),
     ticket: state.ticket(),
-    loan: state.loan(),
+    loan: loanDebt(),
+    loans,
+    debt: debtSummary(),
+    loanChoices: { periods: LOAN_PERIOD_CHOICES, rates: LOAN_RATE_CHOICES.map(r => Math.round(r * 1000) / 10) },
     visitorToday: visitors.filter(v => v.day === state.day()).reduce((s, v) => s + v.count, 0),
     visitors,
     zones: allZones(),
@@ -399,21 +517,55 @@ app.post('/api/zones/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-// ---- 票务 / 贷款 ----
+// ---- 票务 / 分期贷款 ----
 app.post('/api/ticket', (req, res) => {
   const p = num(req.body?.price, 120)
   setSetting('ticket', Math.max(10, Math.min(500, p)))
   res.json({ ok: true, ticket: num(getSetting('ticket')) })
 })
 
+// 申请分期贷款：可选期数(天)与每期利率，等额本息
 app.post('/api/loan', (req, res) => {
-  const amount = num(req.body?.amount, 50000) * -1 * -1
-  let loan = state.loan() + Math.abs(amount)
-  setSetting('loan', loan)
-  let cash = state.cash() + Math.abs(amount)
+  const amount = Math.round(num(req.body?.amount))
+  const periods = Math.round(num(req.body?.periods, 10))
+  // 前端以百分数传入（1 表示每期 1%）
+  const rate = req.body?.ratePct !== undefined
+    ? num(req.body.ratePct) / 100
+    : num(req.body?.rate, 0.01)
+  if (!Number.isFinite(amount) || amount < LOAN_MIN || amount > LOAN_MAX) {
+    return res.status(400).json({ ok: false, msg: `贷款金额需在 ${LOAN_MIN.toLocaleString()} ~ ${LOAN_MAX.toLocaleString()} 之间` })
+  }
+  if (!Number.isInteger(periods) || periods < 1 || periods > 60) {
+    return res.status(400).json({ ok: false, msg: '期数需为 1~60 之间的整数（天）' })
+  }
+  if (!Number.isFinite(rate) || rate < 0 || rate > 0.05) {
+    return res.status(400).json({ ok: false, msg: '每期利率需在 0% ~ 5% 之间' })
+  }
+  const installment = calcInstallment(amount, rate, periods)
+  const day = state.day()
+  const r = db.prepare(`INSERT INTO loans(principal,rate,periods,installment,remain_principal,start_day,created_tick)
+                        VALUES(?,?,?,?,?,?,?)`)
+    .run(amount, rate, periods, installment, amount, day, state.tick())
+  const cash = state.cash() + amount
   setSetting('cash', Math.round(cash))
-  logFinance(state.day(), '贷款', Math.abs(amount), '取得贷款')
-  res.json({ ok: true, loan })
+  logFinance(day, '贷款', amount, `取得分期贷款 #${r.lastInsertRowid}：${periods} 期 · 每期 ${Math.round(rate * 1000) / 10}% · 月供 ¥${installment.toLocaleString()}`)
+  res.json({ ok: true, id: Number(r.lastInsertRowid), installment, periods, ratePct: Math.round(rate * 1000) / 10, loan: loanDebt() })
+})
+
+// 提前结清单笔贷款：仅收取剩余本金与已产生的逾期利息/罚息，豁免未到期利息
+app.post('/api/loans/:id/repay', (req, res) => {
+  const id = num(req.params.id)
+  const l = db.prepare("SELECT * FROM loans WHERE id=? AND status='active'").get(id)
+  if (!l) return res.status(404).json({ ok: false, msg: '贷款不存在或已结清' })
+  const need = l.remain_principal + l.arrears_i
+  const cash = state.cash()
+  if (cash < need) return res.status(400).json({ ok: false, msg: `资金不足，结清需 ¥${need.toLocaleString()}` })
+  const day = state.day()
+  if (l.arrears_i > 0) logFinance(day, '利息', -l.arrears_i, `贷款 #${l.id} 结清逾期利息/罚息`)
+  logFinance(day, '贷款', -l.remain_principal, `提前结清贷款 #${l.id} 本金`)
+  setSetting('cash', Math.round(cash - need))
+  db.prepare("UPDATE loans SET remain_principal=0, arrears_p=0, arrears_i=0, status='done' WHERE id=?").run(l.id)
+  res.json({ ok: true, loan: loanDebt() })
 })
 
 // ---- 活动与事件 ----

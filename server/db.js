@@ -86,9 +86,25 @@ CREATE TABLE IF NOT EXISTS finance (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   tick INTEGER NOT NULL,
   day INTEGER NOT NULL,
-  label TEXT NOT NULL,           -- 门票/游乐/餐饮/纪念品/工资/维护/活动/事故/贷款
-  amount INTEGER NOT NULL,       -- 正负
+  label TEXT NOT NULL,           -- 门票/游乐/餐饮/纪念品/工资/租金/运营/消费/建设/升级/扩建/活动/贷款/利息
+  amount INTEGER NOT NULL,       -- 正负(贷款正数=放款/本金返还，负数=偿还本金；利息负数=付息/罚息)
   detail TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS loans (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  principal INTEGER NOT NULL,        -- 借款本金
+  rate REAL NOT NULL,                -- 每期(每日)利率
+  periods INTEGER NOT NULL,          -- 总期数(天)
+  installment INTEGER NOT NULL,      -- 每期等额本息应还
+  remain_principal INTEGER NOT NULL, -- 剩余本金(含已到期未还的本金)
+  paid_periods INTEGER NOT NULL DEFAULT 0,
+  arrears_p INTEGER NOT NULL DEFAULT 0, -- 逾期挂账本金
+  arrears_i INTEGER NOT NULL DEFAULT 0, -- 逾期挂账利息(含罚息)
+  overdue_days INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'active', -- active/done
+  start_day INTEGER NOT NULL,
+  created_tick INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -132,7 +148,6 @@ function seed() {
   setSetting('reputation', 70)
   setSetting('cash', 200000)
   setSetting('guestBase', 600)
-  setSetting('loan', 0)
 
   const iz = db.prepare('INSERT INTO zones(name,theme,unlocked,capacity,cleanliness,scenery,pos_row,pos_col) VALUES(?,?,?,?,?,?,?,?)')
   const zones = [

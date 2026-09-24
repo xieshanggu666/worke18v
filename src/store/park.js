@@ -25,6 +25,8 @@ export const useParkStore = defineStore('park', {
     events: s => s.data?.events || [],
     finance: s => s.data?.finance || [],
     visitors: s => s.data?.visitors || [],
+    loans: s => s.data?.loans || [],
+    debt: s => s.data?.debt || { remainPrincipal: 0, arrears: 0, overdueCount: 0 },
     activeEvents: s => (s.data?.events || []).filter(e => e.status === 'active')
   },
   actions: {
@@ -49,7 +51,8 @@ export const useParkStore = defineStore('park', {
     unlock(zoneId) { return this.api('POST', `/zones/${zoneId}/unlock`, {}) },
     updateZone(zoneId, payload) { return this.api('POST', `/zones/${zoneId}`, payload) },
     setTicket(price) { return this.api('POST', '/ticket', { price }) },
-    takeLoan(amount) { return this.api('POST', '/loan', { amount }) },
+    takeLoan(amount, periods, ratePct) { return this.api('POST', '/loan', { amount, periods, ratePct }) },
+    repayLoan(id) { return this.api('POST', `/loans/${id}/repay`, {}) },
     planEvent(payload) { return this.api('POST', '/events', payload) },
     resolveEvent(id) { return this.api('POST', `/events/${id}/resolve`, {}) }
   }
